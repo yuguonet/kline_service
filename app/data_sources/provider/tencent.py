@@ -36,7 +36,6 @@ _TF_MAP = {
     "1D": ("fqkline", "day"), "1W": ("fqkline", "week"),
 }
 
-
 def _parse_time(ds: str) -> Optional[int]:
     raw = str(ds or "").strip()
     if not raw:
@@ -51,7 +50,6 @@ def _parse_time(ds: str) -> Optional[int]:
         return int(ts / 1000) if ts > 10**12 else ts
     except Exception:
         return None
-
 
 def _rows_to_dicts(rows: list) -> List[Dict[str, Any]]:
     out = []
@@ -88,8 +86,6 @@ class TencentDataSource:
         "markets": {"CNStock", "HKStock"},
     }
 
-    # ── K线 ──────────────────────────────────────────────────────
-
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
@@ -106,7 +102,6 @@ class TencentDataSource:
         limiter = get_tencent_limiter()
         limiter.wait()
 
-        # fqkline 不传复权参数 → 返回原始数据，复权由上层统一处理
         if endpoint == "mkline":
             url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline"
             params = {"param": f"{c},{tc_tf},{int(count)}"}
@@ -135,7 +130,6 @@ class TencentDataSource:
         if endpoint == "mkline":
             rows = root.get(tc_tf)
         else:
-            # 不传复权参数，API 返回原始数据，key 为 tc_tf (day/week)
             arr = root.get(tc_tf)
             if isinstance(arr, list) and arr:
                 rows = arr
@@ -146,8 +140,6 @@ class TencentDataSource:
                         break
 
         return _rows_to_dicts(rows) if isinstance(rows, list) else []
-
-    # ── 行情 ──────────────────────────────────────────────────────
 
     @retry_with_backoff(max_attempts=3, base_delay=1.2, max_delay=8.0, exceptions=(Exception,))
     def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:

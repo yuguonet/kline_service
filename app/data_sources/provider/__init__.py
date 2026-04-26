@@ -75,6 +75,18 @@ class BaseDataSource(Protocol):
         """统一取K线 — 日/周/分钟共用"""
         ...
 
+    def fetch_kline_batch(
+        self, codes: List[str], timeframe: str, count: int,
+        adj: str = "qfq", timeout: int = 15,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        批量K线（单次HTTP或单次API调用）。
+
+        能一次拉全市场的源（如东财 clist）应实现此方法。
+        未实现的源自动退化为逐只调用 fetch_kline。
+        """
+        ...
+
     def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
         """单只实时行情"""
         ...
@@ -125,7 +137,7 @@ def get_providers(
     获取可用 provider 列表，按 priority 排序。
 
     Args:
-        capability: 过滤能力 ('kline' / 'quote' / 'batch_quote')
+        capability: 过滤能力 ('kline' / 'kline_batch' / 'quote' / 'batch_quote')
         timeframe:  过滤K线周期 ('1D' / '5m' / ...)
         market:     过滤市场 ('CNStock' / 'HKStock' / ...)
     """
@@ -157,6 +169,24 @@ def get_providers(
         ]
 
     return providers
+
+
+def get_providers_with_batch(
+    timeframe: str = None,
+    market: str = None,
+) -> List[Tuple[BaseDataSource, bool]]:
+    """
+    获取 provider 列表，同时标记每个源是否支持批量K线。
+
+    Returns:
+        [(provider, has_batch), ...] 按 priority 排序
+    """
+    providers = get_providers("kline", timeframe=timeframe, market=market)
+    result = []
+    for p in providers:
+        has_batch = p.capabilities.get("kline_batch", False)
+        result.append((p, has_batch))
+    return result
 
 
 def get_provider(name: str) -> Optional[BaseDataSource]:

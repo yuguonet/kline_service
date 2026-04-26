@@ -37,7 +37,6 @@ _exdiv_cache: Dict[str, Tuple[List[Dict], float]] = {}
 _exdiv_cache_lock = threading.Lock()
 _EXDIV_CACHE_TTL = 86400
 
-
 def fetch_exdividend_events(code: str) -> List[Dict[str, Any]]:
     """
     获取股票的除权除息记录（东财 API）。

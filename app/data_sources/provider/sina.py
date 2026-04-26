@@ -47,13 +47,8 @@ _SINA_TF_TO_SCALE = {
     "1m": 1, "5m": 5, "15m": 15, "30m": 30, "1H": 60, "1D": 240,
 }
 
-
 def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
-    """
-    解析新浪行情响应:
-    var hq_str_sh600519="贵州茅台,1750.00,1745.00,...";
-    """
-    m = re.search(r'"(.+?)"', text)
+    m = re.search(r'\"(.+?)\"', text)
     if not m:
         return None
     parts = m.group(1).split(",")
@@ -70,26 +65,17 @@ def _parse_sina_quote(text: str) -> Optional[Dict[str, Any]]:
         low = float(parts[5]) if parts[5] else 0.0
         volume = float(parts[8]) if parts[8] else 0.0
         amount = float(parts[9]) if parts[9] else 0.0
-
         if last == 0 and prev_close == 0 and open_p == 0:
             return None
-
         return {
-            "name": name,
-            "open": open_p,
-            "prev_close": prev_close,
-            "last": last,
-            "high": high,
-            "low": low,
-            "volume": volume,
-            "amount": amount,
+            "name": name, "open": open_p, "prev_close": prev_close,
+            "last": last, "high": high, "low": low,
+            "volume": volume, "amount": amount,
         }
     except (ValueError, IndexError):
         return None
 
-
 def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
-    """解析新浪 JSON API K线响应（日K和分钟K通用）"""
     out: List[Dict[str, Any]] = []
     for item in data:
         try:
@@ -105,7 +91,6 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
                     continue
             if ts is None:
                 continue
-
             o = float(item.get("open", 0))
             h = float(item.get("high", 0))
             low = float(item.get("low", 0))
@@ -114,24 +99,15 @@ def _sina_kline_to_dicts(data: list, count: int) -> List[Dict[str, Any]]:
             if o == 0 and c == 0:
                 continue
             out.append({
-                "time": ts,
-                "open": round(o, 4),
-                "high": round(h, 4),
-                "low": round(low, 4),
-                "close": round(c, 4),
-                "volume": round(v, 2),
+                "time": ts, "open": round(o, 4), "high": round(h, 4),
+                "low": round(low, 4), "close": round(c, 4), "volume": round(v, 2),
             })
         except (ValueError, TypeError, KeyError):
             continue
-
     out.sort(key=lambda x: x["time"])
-    if len(out) > count:
-        out = out[-count:]
-    return out
-
+    return out[-count:] if len(out) > count else out
 
 def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
-    """备用: 从 hisdata/klc_kl.js 获取日K线"""
     url = f"https://finance.sina.com.cn/realstock/company/{sc}/hisdata/klc_kl.js"
     _sina_limiter.wait()
     resp = requests.get(
@@ -141,13 +117,11 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
     )
     resp.encoding = "gbk"
     text = resp.text or ""
-
     pattern = re.compile(
         r"(\d{4}-\d{2}-\d{2}),\s*"
         r"([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),\s*"
         r"([\d.]+)"
     )
-
     out: List[Dict[str, Any]] = []
     for m in pattern.finditer(text):
         try:
@@ -162,20 +136,15 @@ def _fetch_sina_kline_hisdata(sc: str, count: int, timeout: int) -> List[Dict[st
             })
         except (ValueError, TypeError):
             continue
-
     if len(out) > count:
         out = out[-count:]
     out.sort(key=lambda x: x["time"])
     return out
 
 
-# ================================================================
-# Provider
-# ================================================================
-
 @register(priority=20)
 class SinaDataSource:
-    """新浪财经 — A股数据源（国内直连、免费、支持复权）"""
+    """新浪财经 — A股数据源"""
 
     name = "sina"
     priority = 20
@@ -189,8 +158,6 @@ class SinaDataSource:
         "markets": {"CNStock"},
     }
 
-    # ── K线 ──────────────────────────────────────────────────────
-
     @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
     ))
@@ -198,98 +165,58 @@ class SinaDataSource:
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
     ) -> List[Dict[str, Any]]:
-        """
-        新浪K线 — 返回原始(未复权)数据，复权由上层统一处理。
-
-        日K: JSON API / hisdata 备用
-        分钟K: JSONP 接口
-        """
         sc = to_sina_code(code)
         if not sc:
             return []
-
         scale = _SINA_TF_TO_SCALE.get(timeframe)
         if scale is None:
             return []
-
         _sina_limiter.wait()
-
         if timeframe != "1D":
             return self._fetch_minute_kline(sc, scale, count, timeout)
-
         return self._fetch_raw_daily_kline(sc, count, timeout)
 
-    def _fetch_raw_daily_kline(
-        self, sc: str, count: int, timeout: int,
-    ) -> List[Dict[str, Any]]:
-        """获取新浪原始日K线（不复权）"""
+    def _fetch_raw_daily_kline(self, sc: str, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://vip.stock.finance.sina.com.cn/cn/api/json.php/CN_MarketDataService.getKLineData"
-        params = {
-            "symbol": sc,
-            "scale": 240,
-            "ma": "no",
-            "datalen": min(int(count), 2000),
-        }
-
+        params = {"symbol": sc, "scale": 240, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
             url,
             headers=get_request_headers(referer="https://finance.sina.com.cn/"),
             params=params, timeout=timeout,
         )
-
         try:
             data = resp.json()
         except Exception:
             data = None
-
         if isinstance(data, list) and data:
             return _sina_kline_to_dicts(data, count)
-
-        # 备用: hisdata/klc_kl
         return _fetch_sina_kline_hisdata(sc, count, timeout)
 
-
-    def _fetch_minute_kline(
-        self, sc: str, scale: int, count: int, timeout: int,
-    ) -> List[Dict[str, Any]]:
-        """新浪分钟K线 — quotes.sina.cn JSONP 接口"""
+    def _fetch_minute_kline(self, sc: str, scale: int, count: int, timeout: int) -> List[Dict[str, Any]]:
         url = "https://quotes.sina.cn/cn/api/jsonp_v2.php/var/CN_MarketDataService.getKLineData"
-        params = {
-            "symbol": sc,
-            "scale": scale,
-            "ma": "no",
-            "datalen": min(int(count), 2000),
-        }
-
+        params = {"symbol": sc, "scale": scale, "ma": "no", "datalen": min(int(count), 2000)}
         resp = requests.get(
             url,
             headers=get_request_headers(referer="https://finance.sina.com.cn/"),
             params=params, timeout=timeout,
         )
-
         text = (resp.text or "").strip()
         m = re.search(r'\[.*\]', text, re.DOTALL)
         if not m:
             return []
-
         try:
             data = json.loads(m.group())
         except Exception:
             return []
-
         return _sina_kline_to_dicts(data, count) if isinstance(data, list) else []
-
-    # ── 行情 ──────────────────────────────────────────────────────
 
     @retry_with_backoff(max_attempts=3, base_delay=1.5, max_delay=10.0, exceptions=(
         requests.exceptions.RequestException, ConnectionError, TimeoutError,
     ))
     def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """新浪实时行情 — hq.sinajs.cn"""
         sc = to_sina_code(code)
         if not sc:
             return None
-
         _sina_quote_limiter.wait()
         resp = requests.get(
             f"https://hq.sinajs.cn/list={sc}",
@@ -300,7 +227,6 @@ class SinaDataSource:
         quote = _parse_sina_quote(resp.text)
         if not quote:
             return None
-
         quote["symbol"] = sc
         last = quote["last"]
         prev = quote["prev_close"]
@@ -311,22 +237,16 @@ class SinaDataSource:
         return quote
 
     def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """
-        新浪批量行情 — 一个 HTTP 请求获取多只股票。
-        """
         if not codes:
             return {}
         sina_codes = [to_sina_code(c) for c in codes if c]
         if not sina_codes:
             return {}
-
         batch_size = 500
         result: Dict[str, Dict[str, Any]] = {}
-
         for i in range(0, len(sina_codes), batch_size):
             batch = sina_codes[i:i + batch_size]
             query = ",".join(batch)
-
             _sina_quote_limiter.wait()
             try:
                 resp = requests.get(
@@ -338,7 +258,6 @@ class SinaDataSource:
             except Exception as e:
                 logger.warning(f"[新浪批量行情] 请求失败: {e}")
                 continue
-
             for line in (resp.text or "").strip().split("\n"):
                 line = line.strip().rstrip(";")
                 m = re.search(r'hq_str_(\w+)="(.+?)"', line)
@@ -363,18 +282,11 @@ class SinaDataSource:
                         continue
                     chg = round(last - prev_close, 4) if prev_close else 0.0
                     result[code_str] = {
-                        "name": name,
-                        "last": last,
-                        "change": chg,
+                        "name": name, "last": last, "change": chg,
                         "changePercent": round(chg / prev_close * 100, 2) if prev_close else 0.0,
-                        "open": open_p,
-                        "high": high,
-                        "low": low,
-                        "previousClose": prev_close,
-                        "volume": vol,
-                        "symbol": code_str,
+                        "open": open_p, "high": high, "low": low,
+                        "previousClose": prev_close, "volume": vol, "symbol": code_str,
                     }
                 except (ValueError, IndexError):
                     continue
-
         return result

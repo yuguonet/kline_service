@@ -4,17 +4,29 @@ K线数据服务 — 新架构
 
 上层入口，统一调度:
   用户请求 → 分类(市场/数据类型) → 查缓存 → 命中直接返回
-                                 → 未命中 → 调度层取数据
+                                 → 未命中 → 协助层取数据
                                           → 写缓存 → 复权 → 返回
+
+三层架构:
+  调度层(KlineService) → 协助层(Coordinator) → 数据源层(Providers)
+
+  调度层: 负责缓存、复权、单源 fallback、竞赛
+  协助层: 负责按源分组、并发控制、批量优先
+  数据源层: 负责实际数据获取（单模式，不自行并行）
 
 两层存储:
   热数据（行情/分钟线） → 内存 dict，丢了30s重取
   温数据（K线/股票信息） → feather 文件，进程重启还在
 
 调用链:
-  KlineService.get_kline(symbol, tf, limit) → 查缓存 → sequential_fallback → adjust_kline → 返回
-  KlineService.get_ticker(symbol)           → 查缓存 → race               → 返回
-  KlineService.get_kline_batch(symbols)     → 查缓存 → dynamic_queue      → 返回
+  KlineService.get_kline(symbol, tf, limit)
+    → 查缓存 → sequential_fallback → adjust_kline → 返回
+
+  KlineService.get_ticker(symbol)
+    → 查缓存 → race → 返回
+
+  KlineService.get_kline_batch(symbols)
+    → 查缓存 → Coordinator.coordinate_kline → 写缓存 → adjust_kline → 返回
 """
 
 from __future__ import annotations
@@ -22,7 +34,8 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from app.data_sources.cache import get_cache, make_key, get_ttl
-from app.data_sources.dispatcher import sequential_fallback, dynamic_queue, InflightDedup
+from app.data_sources.dispatcher import sequential_fallback, InflightDedup
+from app.data_sources.coordinator import get_coordinator
 from app.data_sources.provider import get_providers
 from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
 from app.data_sources.normalizer import detect_market
@@ -66,7 +79,6 @@ _MARKET_ALIASES = {
     "期货":     MARKET_FUTURES,
 }
 
-
 def _resolve_market(market: str, symbol: str) -> str:
     """
     解析市场类型。
@@ -100,12 +112,13 @@ def _resolve_market(market: str, symbol: str) -> str:
 
 
 class KlineService:
-    """K线数据服务（新架构：Provider自注册 + 两层缓存 + 统一复权）"""
+    """K线数据服务（新架构：Provider自注册 + 两层缓存 + 统一复权 + 协助层协调）"""
 
     def __init__(self):
         self._cache = get_cache()
         self._cb = get_realtime_circuit_breaker()
         self._dedup = InflightDedup()
+        self._coordinator = get_coordinator()
 
     # ═══════════════════════════════════════════════════════════════════
     #  对外入口
@@ -171,11 +184,12 @@ class KlineService:
         cached_symbols: Optional[set] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        批量K线 — 核心优化路径:
+        批量K线 — 通过协助层协调:
 
         1. 查缓存（磁盘 feather）→ 命中直接用（0次API）
-        2. 未命中的 → 动态队列分给不同源并行取
+        2. 未命中的 → 协助层按源分组 + 并发控制 + 批量优先
         3. 取到的写入磁盘缓存
+        4. 统一复权后返回
 
         Args:
             market:         市场类型（兼容旧接口，新架构不使用）
@@ -209,24 +223,25 @@ class KlineService:
 
         logger.info(f"[批量K线] 缓存命中 {len(result)}/{len(symbols)}，需取 {len(need_fetch)}")
 
-        # 2. 动态队列: 分源并行取（每个源干不同的活）
-        providers = [
-            (p.name, lambda s, p=p: p.fetch_kline(s, timeframe, limit))
-            for p in get_providers("kline", timeframe=timeframe, market=resolved_market)
-        ]
+        # 2. 通过协助层协调取数据（按源分组 + 并发控制 + 批量优先）
+        providers = get_providers("kline", timeframe=timeframe, market=resolved_market)
 
-        fetched, failed = dynamic_queue(
-            symbols=need_fetch, providers=providers, cb=self._cb,
-            timeout=10.0,
-            validate=lambda bars: bars and len(bars) > 0,
+        fetched, failed = self._coordinator.coordinate_kline(
+            symbols=need_fetch,
+            timeframe=timeframe,
+            limit=limit,
+            providers=providers,
+            cb=self._cb,
+            market=resolved_market,
         )
 
         # 3. 写缓存（原始数据）+ 合并结果
         ttl = get_ttl("kline", timeframe)
         for sym, bars in fetched.items():
-            key = make_key("kline", sym, timeframe, limit)
-            self._cache.set(key, bars, ttl, data_type)
-            result[sym] = bars
+            if bars:
+                key = make_key("kline", sym, timeframe, limit)
+                self._cache.set(key, bars, ttl, data_type)
+                result[sym] = bars
 
         if failed:
             logger.warning(f"[批量K线] {len(failed)} 只所有源均失败: {failed[:5]}{'...' if len(failed) > 5 else ''}")
@@ -361,6 +376,21 @@ class KlineService:
     def cache_stats(self) -> Dict[str, Any]:
         """缓存统计"""
         return self._cache.stats()
+
+    def source_stats(self) -> Dict[str, Any]:
+        """各数据源吞吐统计（由协助层跟踪）"""
+        from app.data_sources.source_config import get_all_enabled_sources
+        return {
+            cfg.name: {
+                "qps": round(cfg.throughput, 2),
+                "success_rate": round(cfg.success_rate, 3),
+                "avg_latency": round(cfg.avg_latency, 3),
+                "effective_weight": round(cfg.effective_weight(), 2),
+                "max_workers": cfg.max_workers,
+                "markets": list(cfg.markets),
+            }
+            for cfg in get_all_enabled_sources()
+        }
 
     # ═══════════════════════════════════════════════════════════════════
     #  预热

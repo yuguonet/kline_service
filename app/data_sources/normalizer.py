@@ -25,7 +25,6 @@ def safe_float(v: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
-
 def safe_int(v: Any, default: int = 0) -> int:
     """安全转 int，"-"/""/None → default"""
     if v is None or v == "-" or v == "":
@@ -34,7 +33,6 @@ def safe_int(v: Any, default: int = 0) -> int:
         return int(float(v))
     except (TypeError, ValueError):
         return default
-
 
 def detect_market(code: str) -> Tuple[str, str]:
     """
@@ -108,7 +106,6 @@ def to_tencent_code(code: str) -> str:
         return f"{market.lower()}{digits}"
     return (code or "").strip().lower()
 
-
 def to_sina_code(code: str) -> str:
     """
     转换为新浪格式: sh600519 / sz000001 / bj830799
@@ -116,7 +113,6 @@ def to_sina_code(code: str) -> str:
     新浪格式与腾讯相同（小写前缀 + 数字）。
     """
     return to_tencent_code(code)
-
 
 def to_eastmoney_secid(code: str) -> str:
     """
@@ -139,7 +135,6 @@ def to_eastmoney_secid(code: str) -> str:
     # SZ / BJ
     return f"0.{digits}"
 
-
 def to_raw_digits(code: str) -> str:
     """
     提取纯6位数字代码（剥离所有前缀/后缀）。
@@ -151,7 +146,6 @@ def to_raw_digits(code: str) -> str:
     """
     _, digits = detect_market(code)
     return digits
-
 
 def to_canonical(code: str) -> str:
     """

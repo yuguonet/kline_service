@@ -32,15 +32,6 @@ logger = get_logger(__name__)
 def _fetch_tencent_hk_kline(
     code: str, period: str, count: int, adj: str = "qfq", timeout: int = 10,
 ) -> List[Dict[str, Any]]:
-    """
-    腾讯港股K线 — fqkline 接口。
-
-    Args:
-        code:   hk00700 格式
-        period: day / week
-        count:  请求条数
-        adj:    qfq / hfq
-    """
     import requests
     from datetime import datetime
 
@@ -67,7 +58,6 @@ def _fetch_tencent_hk_kline(
     if not isinstance(root, dict):
         return []
 
-    # 查找K线数据: 优先 qfqday / qfqweek，其次 day / week
     rows = None
     for key in ([f"{adj}{period}", period] if adj else [period]):
         arr = root.get(key)
@@ -111,7 +101,6 @@ def _fetch_tencent_hk_kline(
 
 
 def _fetch_tencent_hk_quote(code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-    """腾讯港股实时行情"""
     import requests
 
     get_tencent_limiter().wait()
@@ -172,7 +161,7 @@ class HKStockDataSource:
         "kline": True,
         "kline_tf": {"1m", "5m", "15m", "30m", "1H", "1D", "1W"},
         "quote": True,
-        "batch_quote": False,  # 港股暂不支持批量行情
+        "batch_quote": False,
         "hk": True,
         "markets": {"HKStock"},
     }
@@ -180,34 +169,21 @@ class HKStockDataSource:
     def __init__(self):
         self.cb = get_overseas_circuit_breaker()
 
-    # ── 行情 ──────────────────────────────────────────────────────
-
     def fetch_quote(self, code: str, timeout: int = 8) -> Optional[Dict[str, Any]]:
-        """港股实时行情 — 腾讯接口"""
         hk_code = normalize_hk_code(code)
         if not hk_code:
             return None
         return _fetch_tencent_hk_quote(hk_code, timeout)
 
-    # ── K线 ──────────────────────────────────────────────────────
-
     def fetch_kline(
         self, code: str, timeframe: str = "1D", count: int = 300,
         adj: str = "qfq", timeout: int = 10,
     ) -> List[Dict[str, Any]]:
-        """
-        港股K线 — 多源降级。
-
-        日/周线: 腾讯 → yfinance → AkShare → Twelve Data
-        分钟线:  yfinance → AkShare → Twelve Data
-        """
         hk_code = normalize_hk_code(code)
         if not hk_code:
             return []
-
         lim = max(int(count or 300), 1)
 
-        # Tier 1: 腾讯（日/周线，国内直连）
         if timeframe in ("1D", "1W"):
             tf_map = {"1D": "day", "1W": "week"}
             period = tf_map.get(timeframe, "day")
@@ -216,19 +192,16 @@ class HKStockDataSource:
                 self.cb.record_success(self.name)
                 return bars
 
-        # Tier 2: yfinance（全周期）
         bars = self._try_yfinance(hk_code, timeframe, lim, timeout)
         if bars:
             self.cb.record_success(self.name)
             return bars
 
-        # Tier 3: AkShare（国内兜底）
         bars = self._try_akshare(hk_code, timeframe, lim, timeout)
         if bars:
             self.cb.record_success(self.name)
             return bars
 
-        # Tier 4: Twelve Data（海外付费，最后降级）
         bars = self._try_twelvedata(hk_code, timeframe, lim, timeout)
         if bars:
             self.cb.record_success(self.name)
@@ -237,7 +210,6 @@ class HKStockDataSource:
         return []
 
     def fetch_quotes_batch(self, codes: List[str], timeout: int = 10) -> Dict[str, Dict[str, Any]]:
-        """港股暂不支持批量行情，逐只调用 fetch_quote"""
         result = {}
         for code in codes:
             q = self.fetch_quote(code, timeout)
@@ -245,12 +217,7 @@ class HKStockDataSource:
                 result[code] = q
         return result
 
-    # ── 海外源降级 ──────────────────────────────────────────────
-
-    def _try_yfinance(
-        self, hk_code: str, timeframe: str, limit: int, timeout: int,
-    ) -> List[Dict[str, Any]]:
-        """yfinance 降级 — 延迟 import，失败不报错"""
+    def _try_yfinance(self, hk_code: str, timeframe: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
         if not self.cb.is_available("yfinance"):
             return []
         try:
@@ -267,10 +234,7 @@ class HKStockDataSource:
             self.cb.record_failure("yfinance", str(e))
         return []
 
-    def _try_akshare(
-        self, hk_code: str, timeframe: str, limit: int, timeout: int,
-    ) -> List[Dict[str, Any]]:
-        """AkShare 降级 — 延迟 import，失败不报错"""
+    def _try_akshare(self, hk_code: str, timeframe: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
         if not self.cb.is_available("akshare"):
             return []
         try:
@@ -296,10 +260,7 @@ class HKStockDataSource:
             self.cb.record_failure("akshare", str(e))
         return []
 
-    def _try_twelvedata(
-        self, hk_code: str, timeframe: str, limit: int, timeout: int,
-    ) -> List[Dict[str, Any]]:
-        """Twelve Data 降级 — 延迟 import，失败不报错"""
+    def _try_twelvedata(self, hk_code: str, timeframe: str, limit: int, timeout: int) -> List[Dict[str, Any]]:
         if not self.cb.is_available("twelvedata"):
             return []
         try:

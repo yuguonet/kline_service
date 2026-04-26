@@ -1,20 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-API 感知调度器 — 省调用 + 保时效
+调度器 — 单源 fallback + 竞赛
 
-核心策略:
+核心策略（保持不变）:
 1. 缓存优先 — 有缓存就不发请求
 2. 请求去重 — 同一 symbol 正在取时，等结果，不重复发
 3. 顺序 fallback — K线逐只取，不race（省API）
 4. 竞赛 race   — 行情有批量接口，race代价低
-5. 动态队列    — 批量K线分源并行，源干完一个抢下一个，不闲着
+
+变更说明:
+  原 dynamic_queue（批量并行）已移至协助层 coordinator.py。
+  协助层在数据源层和调度层之间，负责:
+    - 按源分组 symbols
+    - 每个源的并发控制（max_workers）
+    - 批量优先（能批量的绝不并发）
+  调度层不再直接管理线程池，只负责单源 fallback 和竞赛。
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import threading
-import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 from app.data_sources.circuit_breaker import CircuitBreaker
@@ -150,7 +156,6 @@ def race(
         try:
             data = fetcher()
             if done_event.is_set():
-                # 已有更快的源返回了，不算失败，只是慢
                 return
             if validate(data):
                 with lock:
@@ -173,133 +178,3 @@ def race(
         executor.shutdown(wait=False)
 
     return result_holder["result"], result_holder["source"]
-
-
-# ================================================================
-# 批量分源 — 动态队列（源干完一个立刻拿下一个，不闲着）
-# ================================================================
-
-def dynamic_queue(
-    symbols: List[str],
-    providers: List[Tuple[str, Callable[[str], Optional[T]]]],
-    cb: CircuitBreaker,
-    timeout: float = 10.0,
-    validate: Callable[[T], bool] = lambda x: x is not None,
-) -> Tuple[Dict[str, T], List[str]]:
-    """
-    动态队列 — 源干完一个活立刻拿下一个，不闲着。
-
-    每个 symbol 最多被所有可用源各试一次，全部失败则放弃，不再弹跳。
-    返回 (成功结果, 失败symbol列表)，上层据此决定是否反馈给用户或缓存失败。
-
-    流程:
-      队列[1,2,3,4,5] → A抢1, B抢2, C抢3
-      B完抢4, C完抢5
-      A失败 → 放回队首，换B/C接盘（但只换一次，不无限弹）
-    """
-    if not symbols or not providers:
-        return {}, list(symbols)
-
-    available = [(n, f) for n, f in providers if cb.is_available(n)]
-    if not available:
-        return {}, list(symbols)
-
-    source_names = [n for n, _ in available]
-
-    # 任务队列 + 结果收集
-    queue = list(symbols)
-    queue_lock = threading.Lock()
-    results: Dict[str, T] = {}
-    results_lock = threading.Lock()
-
-    # per-symbol 失败记录: symbol → 已试过的源集合
-    symbol_tried: Dict[str, set] = {}
-    symbol_tried_lock = threading.Lock()
-    failed: List[str] = []
-    failed_lock = threading.Lock()
-
-    # 每源连续失败计数（连续失败超阈值就暂停该源）
-    source_fail_count: Dict[str, int] = {}
-    MAX_SOURCE_FAILS = 3
-
-    def _get_next_task() -> Optional[str]:
-        """从队列取下一个任务（线程安全）"""
-        with queue_lock:
-            if queue:
-                return queue.pop(0)
-        return None
-
-    def _mark_failed(sym: str):
-        """标记 symbol 为彻底失败"""
-        with failed_lock:
-            if sym not in failed:
-                failed.append(sym)
-
-    def _worker(source_name: str, fetcher: Callable[[str], Optional[T]]):
-        """单个源的工作循环：取任务 → 执行 → 拿下一个"""
-        while True:
-            # 检查该源是否连续失败太多
-            if source_fail_count.get(source_name, 0) >= MAX_SOURCE_FAILS:
-                break
-
-            sym = _get_next_task()
-            if sym is None:
-                break  # 队列空了
-
-            # 记录该源试过这个 symbol
-            with symbol_tried_lock:
-                symbol_tried.setdefault(sym, set()).add(source_name)
-
-            try:
-                data = fetcher(sym)
-                if validate(data):
-                    cb.record_success(source_name)
-                    source_fail_count[source_name] = 0
-                    with results_lock:
-                        results[sym] = data
-                else:
-                    cb.record_failure(source_name, "empty/invalid")
-                    source_fail_count[source_name] = source_fail_count.get(source_name, 0) + 1
-                    _handle_sym_failure(sym, source_name, queue, queue_lock,
-                                             symbol_tried, symbol_tried_lock,
-                                             source_names, _mark_failed)
-            except Exception as e:
-                cb.record_failure(source_name, str(e))
-                source_fail_count[source_name] = source_fail_count.get(source_name, 0) + 1
-                _handle_sym_failure(sym, source_name, queue, queue_lock,
-                                         symbol_tried, symbol_tried_lock,
-                                         source_names, _mark_failed)
-
-    # 所有源同时启动，各自从队列抢活
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(available)) as pool:
-        futures = [
-            pool.submit(_worker, name, fn)
-            for name, fn in available
-        ]
-        concurrent.futures.wait(futures, timeout=timeout + 2)
-
-    return results, failed
-
-
-def _handle_sym_failure(
-    sym: str, source_name: str,
-    queue: list, queue_lock: threading.Lock,
-    symbol_tried: dict, symbol_tried_lock: threading.Lock,
-    source_names: list, mark_failed: Callable,
-):
-    """
-    处理单个 symbol 取失败:
-    - 如果还有源没试过 → 放回队首让其他源接盘
-    - 如果所有源都试过了 → 标记为彻底失败，不放回
-    """
-    with symbol_tried_lock:
-        tried = symbol_tried.get(sym, set())
-
-    # 还有源没试过 → 放回队首
-    untried = [n for n in source_names if n not in tried]
-    if untried:
-        with queue_lock:
-            queue.insert(0, sym)
-    else:
-        # 所有源都试过了，放弃
-        mark_failed(sym)
