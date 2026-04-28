@@ -1,155 +1,52 @@
 # -*- coding: utf-8 -*-
 """
-K线数据服务 — 新架构
+K线数据服务 — 缓存层
 
-上层入口，统一调度:
-  用户请求 → 分类(市场/数据类型) → 查缓存 → 命中直接返回
-                                 → 未命中 → 协助层取数据
-                                          → 写缓存 → 复权 → 返回
+职责单一化:
+  本层只负责缓存读写，所有数据获取逻辑委托给 DataSourceFactory。
 
-三层架构:
-  调度层(KlineService) → 协助层(Coordinator) → 数据源层(Providers)
+架构:
+  KlineService(缓存层) → DataSourceFactory(工厂层) → Coordinator(协助层) → Providers(数据源层)
 
-  调度层: 负责缓存、复权、单源 fallback、竞赛
-  协助层: 负责按源分组、并发控制、批量优先
-  数据源层: 负责实际数据获取（单模式，不自行并行）
+调用链:
+  KlineService.get_kline(symbol, tf, limit)
+    → 查缓存 → 命中? adjust返回 : fetch_kline_raw → 写缓存 → adjust → 返回
+
+  KlineService.get_ticker(symbol)
+    → 查缓存 → 命中? 返回 : fetch_ticker → 写缓存 → 返回
+
+  KlineService.get_kline_batch(symbols)
+    → 逐只查缓存 → 分离已缓存/未缓存
+    → fetch_kline_batch(未缓存的) → 写缓存 → 合并返回
 
 两层存储:
   热数据（行情/分钟线） → 内存 dict，丢了30s重取
   温数据（K线/股票信息） → feather 文件，进程重启还在
-
-调用链:
-  KlineService.get_kline(symbol, tf, limit)
-    → 查缓存 → sequential_fallback → adjust_kline → 返回
-
-  KlineService.get_ticker(symbol)
-    → 查缓存 → race → 返回
-
-  KlineService.get_kline_batch(symbols)
-    → 查缓存 → Coordinator.coordinate_kline → 写缓存 → adjust_kline → 返回
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from app.data_sources.cache import get_cache, make_key, get_ttl
-from app.data_sources.dispatcher import sequential_fallback, InflightDedup
-from app.data_sources.coordinator import get_coordinator
-from app.data_sources.provider import get_providers
-from app.data_sources.circuit_breaker import get_realtime_circuit_breaker
-from app.data_sources.normalizer import detect_market, to_canonical, normalize_hk_code
 from app.data_sources.adjustment import adjust_kline
+from app.data_sources.cache import get_cache, make_key, get_ttl
+from app.data_sources.factory import (
+    get_factory, _parse_symbols, _resolve_market, _normalize_symbols,
+)
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# ================================================================
-# 市场类型常量
-# ================================================================
-# 与旧项目 DataSourceFactory 保持一致，6 种市场类型。
-# 当前已实现 Provider: CNStock, HKStock
-# 待实现 Provider:     USStock, Crypto, Forex, Futures
-
-MARKET_CN_STOCK = "CNStock"   # A股 — kline / quote / batch_quote / 复权
-MARKET_HK_STOCK = "HKStock"   # 港股 — kline / quote
-MARKET_US_STOCK = "USStock"   # 美股 — kline / quote (待实现, 旧项目用 yfinance/twelvedata)
-MARKET_CRYPTO   = "Crypto"    # 加密货币 — kline / quote (待实现, 旧项目用 ccxt)
-MARKET_FOREX    = "Forex"     # 外汇 — kline / quote (待实现, 旧项目用 twelvedata/tiingo)
-MARKET_FUTURES  = "Futures"   # 期货 — kline / quote (待实现, 旧项目用 ccxt)
-
-# 市场别名 → 标准市场名
-_MARKET_ALIASES = {
-    "CNStock":  MARKET_CN_STOCK,
-    "HKStock":  MARKET_HK_STOCK,
-    "USStock":  MARKET_US_STOCK,
-    "Crypto":   MARKET_CRYPTO,
-    "Forex":    MARKET_FOREX,
-    "Futures":  MARKET_FUTURES,
-    # 简写
-    "CN":       MARKET_CN_STOCK,
-    "HK":       MARKET_HK_STOCK,
-    "US":       MARKET_US_STOCK,
-    "A":        MARKET_CN_STOCK,
-    "A股":      MARKET_CN_STOCK,
-    "港股":     MARKET_HK_STOCK,
-    "美股":     MARKET_US_STOCK,
-    "加密":     MARKET_CRYPTO,
-    "外汇":     MARKET_FOREX,
-    "期货":     MARKET_FUTURES,
-}
-
-def _resolve_market(market: str, symbol: str) -> str:
-    """
-    解析市场类型。
-
-    优先用传入的 market 参数；如果为空，根据 symbol 自动推断。
-    """
-    if market:
-        return _MARKET_ALIASES.get(market, market)
-
-    # 自动推断: detect_market 返回 (exchange, digits)
-    s = (symbol or "").strip().upper()
-
-    # Crypto: BTC/USDT, ETH/USDT 格式
-    if "/" in s:
-        return MARKET_CRYPTO
-
-    # Forex: EUR/USD, USD/JPY 格式（同 Crypto 用 / 分隔）
-    # 需要调用方传 market 区分，或后续加 forex symbol 列表判断
-
-    # A股 / 港股: detect_market 从代码格式推断
-    exchange, _ = detect_market(symbol)
-    if exchange in ("SH", "SZ", "BJ"):
-        return MARKET_CN_STOCK
-    if exchange == "HK":
-        return MARKET_HK_STOCK
-
-    # 美股: 纯字母代码（AAPL, TSLA），需调用方传 market
-    # 期货: 合约代码（如 BTC2306），需调用方传 market
-
-    return ""
-
-
-def _parse_symbols(symbol: str) -> List[str]:
-    """拆分逗号分隔的股票代码，返回去重后的非空列表"""
-    return [s.strip() for s in symbol.split(",") if s.strip()]
-
-
-def _normalize_symbols(symbols: List[str], market: str) -> List[str]:
-    """
-    根据市场类型给裸代码补前缀。
-
-    A股: "600519" → "SH600519", "000001" → "SZ000001"
-    港股: "700" → "HK00700", "00700" → "HK00700"
-    已有前缀的不处理: "SH600519" → "SH600519"
-
-    Args:
-        symbols: 原始代码列表（可能裸代码也可能有前缀）
-        market:  已解析的标准市场名（CNStock/HKStock/...）
-    """
-    result = []
-    for sym in symbols:
-        if market == "HKStock":
-            result.append(normalize_hk_code(sym))
-        else:
-            # A股/默认: to_canonical 能处理 600519→SH600519, sh600519→SH600519 等
-            canon = to_canonical(sym)
-            result.append(canon if canon else sym)
-    return result
-
 
 class KlineService:
-    """K线数据服务（新架构：Provider自注册 + 两层缓存 + 统一复权 + 协助层协调）"""
+    """K线数据服务 — 缓存层，只负责缓存读写"""
 
     def __init__(self):
         self._cache = get_cache()
-        self._cb = get_realtime_circuit_breaker()
-        self._dedup = InflightDedup()
-        self._coordinator = get_coordinator()
+        self._factory = get_factory()
 
     # ═══════════════════════════════════════════════════════════════════
-    #  对外入口
+    #  K线
     # ═══════════════════════════════════════════════════════════════════
 
     def get_kline(
@@ -169,10 +66,10 @@ class KlineService:
 
         流程:
           1. 查缓存(原始数据) → 命中 → 复权 → 返回
-          2. 未命中 → Provider 取原始数据 → 写缓存 → 复权 → 返回
+          2. 未命中 → fetch_kline_raw → 写缓存 → 复权 → 返回
 
         Args:
-            market:    市场类型（兼容旧接口，新架构不使用）
+            market:    市场类型（兼容旧接口）
             symbol:    股票代码，支持逗号分隔批量: "A,B,C"
             timeframe: 周期 ('1m','5m','15m','30m','1H','1D','1W','1M')
             limit:     数据条数
@@ -190,26 +87,27 @@ class KlineService:
             symbols = _normalize_symbols(symbols, resolved_market)
             return self.get_kline_batch(resolved_market, symbols, timeframe, limit)
 
-        # 单只模式（原逻辑）
+        # 单只模式
         symbol = symbols[0] if symbols else symbol
         resolved_market = _resolve_market(market, symbol)
 
-        # before_time 模式不缓存（历史翻页）
+        # before_time 模式不缓存（历史翻页），直接穿透
         if before_time:
-            raw = self._fetch_kline(symbol, timeframe, limit, resolved_market)
+            raw = self._factory.fetch_kline_raw(
+                symbol, timeframe, limit, resolved_market
+            )
             return adjust_kline(symbol, raw or [], adj)
 
+        # 1. 查缓存（原始数据）
         key = make_key("kline", symbol, timeframe, limit)
         data_type = f"kline:{timeframe}"
-
-        # 1. 查缓存（原始数据）
         cached = self._cache.get(key, data_type)
         if cached is not None:
             return adjust_kline(symbol, cached, adj)
 
-        # 2. 去重 + 取原始数据
-        raw = self._dedup.get_or_submit(
-            key, lambda: self._fetch_kline(symbol, timeframe, limit, resolved_market)
+        # 2. 缓存未命中 → DataSourceFactory 取原始数据
+        raw = self._factory.fetch_kline_raw(
+            symbol, timeframe, limit, resolved_market
         )
 
         # 3. 写缓存（原始数据）
@@ -228,19 +126,12 @@ class KlineService:
         cached_symbols: Optional[set] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        批量K线 — 通过协助层协调:
+        批量K线 — 缓存分离 + DataSourceFactory 协调。
 
-        1. 查缓存（磁盘 feather）→ 命中直接用（0次API）
-        2. 未命中的 → 协助层按源分组 + 并发控制 + 批量优先
-        3. 取到的写入磁盘缓存
-        4. 统一复权后返回
-
-        Args:
-            market:         市场类型（兼容旧接口，新架构不使用）
-            symbols:        股票代码列表
-            timeframe:      周期
-            limit:          数据条数
-            cached_symbols: 已有缓存的 symbol 集合（兼容旧接口，新架构不使用）
+        流程:
+          1. 逐只查缓存（原始数据）→ 命中 → 复权 → 直接用
+          2. 未命中的 → fetch_kline_batch（通过回调同步写缓存）
+          3. 合并返回
         """
         if not symbols:
             return {}
@@ -255,46 +146,46 @@ class KlineService:
             key = make_key("kline", sym, timeframe, limit)
             cached = self._cache.get(key, data_type)
             if cached is not None:
-                result[sym] = cached
+                result[sym] = adjust_kline(sym, cached, "qfq")
             else:
                 need_fetch.append(sym)
 
         if not need_fetch:
             logger.info(f"[批量K线] 全部 {len(symbols)} 只命中缓存")
-            for sym in result:
-                result[sym] = adjust_kline(sym, result[sym], "qfq")
             return result
 
-        logger.info(f"[批量K线] 缓存命中 {len(result)}/{len(symbols)}，需取 {len(need_fetch)}")
-
-        # 2. 通过协助层协调取数据（按源分组 + 并发控制 + 批量优先）
-        providers = get_providers("kline", timeframe=timeframe, market=resolved_market)
-
-        fetched, failed = self._coordinator.coordinate_kline(
-            symbols=need_fetch,
-            timeframe=timeframe,
-            limit=limit,
-            providers=providers,
-            cb=self._cb,
-            market=resolved_market,
+        logger.info(
+            f"[批量K线] 缓存命中 {len(result)}/{len(symbols)}，"
+            f"需取 {len(need_fetch)}"
         )
 
-        # 3. 写缓存（原始数据）+ 合并结果
+        # 2. 缓存分离 + DataSourceFactory 批量获取
+        #    on_raw_data 回调: 获取到原始数据时立即写缓存，避免二次获取
         ttl = get_ttl("kline", timeframe)
-        for sym, bars in fetched.items():
-            if bars:
-                key = make_key("kline", sym, timeframe, limit)
-                self._cache.set(key, bars, ttl, data_type)
-                result[sym] = bars
 
+        def _write_raw_to_cache(sym: str, raw_bars: List[Dict[str, Any]]):
+            """回调: Coordinator 获取到原始数据时写入缓存"""
+            key = make_key("kline", sym, timeframe, limit)
+            self._cache.set(key, raw_bars, ttl, data_type)
+
+        fetched = self._factory.fetch_kline_batch(
+            need_fetch, timeframe, limit, resolved_market,
+            on_raw_data=_write_raw_to_cache,
+        )
+
+        # 3. 合并结果
+        result.update(fetched)
+
+        failed = [s for s in need_fetch if s not in fetched]
         if failed:
-            logger.warning(f"[批量K线] {len(failed)} 只所有源均失败: {failed[:5]}{'...' if len(failed) > 5 else ''}")
+            logger.warning(
+                f"[批量K线] {len(failed)} 只获取失败: "
+                f"{failed[:5]}{'...' if len(failed) > 5 else ''}"
+            )
 
-        # 4. 对所有结果统一复权
-        for sym in result:
-            result[sym] = adjust_kline(sym, result[sym], "qfq")
-
-        logger.info(f"[批量K线] 最终 {len(result)}/{len(symbols)}，失败 {len(failed)}")
+        logger.info(
+            f"[批量K线] 最终 {len(result)}/{len(symbols)}，失败 {len(failed)}"
+        )
         return result
 
     # ═══════════════════════════════════════════════════════════════════
@@ -308,11 +199,9 @@ class KlineService:
         单只: symbol="SH600519"          → 返回 Dict
         批量: symbol="SH600519,SZ000001" → 返回 Dict[str, Dict]
 
-        单只走 sequential_fallback，批量走 fetch_quotes_batch（一次HTTP取多只）。
-
-        Args:
-            market: 市场类型（'CNStock'/'HKStock'/...，为空则自动推断）
-            symbol: 股票代码，支持逗号分隔批量: "A,B,C"
+        流程:
+          1. 查缓存（内存）→ 命中 → 返回
+          2. 未命中 → DataSourceFactory.fetch_ticker → 写缓存 → 返回
         """
         # 批量模式
         symbols = _parse_symbols(symbol)
@@ -325,20 +214,18 @@ class KlineService:
             symbols = _normalize_symbols(symbols, resolved_market)
             return self._get_ticker_batch(resolved_market, symbols)
 
-        # 单只模式（原逻辑）
+        # 单只模式
         symbol = symbols[0] if symbols else symbol
         resolved_market = _resolve_market(market, symbol)
-        key = make_key("ticker", symbol)
 
         # 1. 查缓存（内存）
+        key = make_key("ticker", symbol)
         cached = self._cache.get(key, "ticker")
         if cached is not None:
             return cached
 
-        # 2. 去重
-        result = self._dedup.get_or_submit(
-            key, lambda: self._fetch_ticker(symbol, resolved_market)
-        )
+        # 2. 缓存未命中 → DataSourceFactory 取数据
+        result = self._factory.fetch_ticker(symbol, resolved_market)
 
         # 3. 写缓存（内存）
         if result and result.get("last", 0) > 0:
@@ -346,15 +233,17 @@ class KlineService:
 
         return result or {"last": 0, "symbol": symbol}
 
-    def _get_ticker_batch(self, market: str, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    def _get_ticker_batch(
+        self, market: str, symbols: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
         """
-        批量行情内部实现。
+        批量行情 — 缓存分离 + DataSourceFactory 批量获取。
 
-        1. 逐只查内存缓存 → 命中直接用
-        2. 未命中的 → 通过 Provider.fetch_quotes_batch 一次HTTP取多只
-        3. 写缓存 → 返回
+        流程:
+          1. 逐只查内存缓存 → 命中直接用
+          2. 未命中的 → DataSourceFactory.fetch_ticker_batch
+          3. 写缓存 → 返回
         """
-        resolved_market = _resolve_market(market, symbols[0] if symbols else "")
         result: Dict[str, Dict[str, Any]] = {}
         need_fetch: List[str] = []
 
@@ -371,10 +260,13 @@ class KlineService:
             logger.info(f"[批量行情] 全部 {len(symbols)} 只命中缓存")
             return result
 
-        logger.info(f"[批量行情] 缓存命中 {len(result)}/{len(symbols)}，需取 {len(need_fetch)}")
+        logger.info(
+            f"[批量行情] 缓存命中 {len(result)}/{len(symbols)}，"
+            f"需取 {len(need_fetch)}"
+        )
 
-        # 2. 通过 fetch_quotes_batch 一次HTTP取多只
-        fetched = self._fetch_tickers_batch(need_fetch, resolved_market)
+        # 2. DataSourceFactory 批量获取
+        fetched = self._factory.fetch_ticker_batch(need_fetch, market)
 
         # 3. 写缓存 + 合并结果
         for sym, data in fetched.items():
@@ -385,45 +277,19 @@ class KlineService:
 
         failed = [s for s in need_fetch if s not in result]
         if failed:
-            logger.warning(f"[批量行情] {len(failed)} 只获取失败: {failed[:5]}{'...' if len(failed) > 5 else ''}")
+            logger.warning(
+                f"[批量行情] {len(failed)} 只获取失败: "
+                f"{failed[:5]}{'...' if len(failed) > 5 else ''}"
+            )
 
-        logger.info(f"[批量行情] 最终 {len(result)}/{len(symbols)}，失败 {len(failed)}")
+        logger.info(
+            f"[批量行情] 最终 {len(result)}/{len(symbols)}，失败 {len(failed)}"
+        )
         return result
 
-    def _fetch_tickers_batch(self, symbols: List[str], market: str = "") -> Dict[str, Dict[str, Any]]:
-        """
-        内部: 用 Provider.fetch_quotes_batch 批量取行情。
-
-        按 priority 顺序尝试，第一个成功取到数据的源返回。
-        批量接口一次HTTP取多只，比逐只 sequential_fallback 高效得多。
-        """
-        providers = get_providers("quote", market=market or None)
-
-        for p in providers:
-            if not self._cb.is_available(p.name):
-                continue
-            try:
-                batch = p.fetch_quotes_batch(symbols)
-                if batch:
-                    self._cb.record_success(p.name)
-                    logger.info(f"[批量行情] {p.name} 一次HTTP取到 {len(batch)}/{len(symbols)} 只")
-                    return batch
-                self._cb.record_failure(p.name, "empty")
-            except Exception as e:
-                self._cb.record_failure(p.name, str(e))
-                logger.warning(f"[批量行情] {p.name} 批量获取失败: {e}")
-
-        # 所有批量源都失败 → fallback 到逐只 sequential_fallback
-        logger.info(f"[批量行情] 所有批量源失败，fallback 到逐只模式")
-        result: Dict[str, Dict[str, Any]] = {}
-        for sym in symbols:
-            try:
-                data = self._fetch_ticker(sym, market)
-                if data and data.get("last", 0) > 0:
-                    result[sym] = data
-            except Exception:
-                pass
-        return result
+    # ═══════════════════════════════════════════════════════════════════
+    #  便捷方法
+    # ═══════════════════════════════════════════════════════════════════
 
     def get_latest_price(self, market: str, symbol: str) -> Optional[Dict[str, Any]]:
         """获取最新价格"""
@@ -436,7 +302,8 @@ class KlineService:
         """获取实时价格（兼容旧接口）"""
         result = {
             'price': 0, 'change': 0, 'changePercent': 0,
-            'high': 0, 'low': 0, 'open': 0, 'previousClose': 0, 'source': 'unknown'
+            'high': 0, 'low': 0, 'open': 0, 'previousClose': 0,
+            'source': 'unknown',
         }
 
         try:
@@ -445,10 +312,15 @@ class KlineService:
                 return {
                     'price': ticker.get('last', 0),
                     'change': ticker.get('change', 0),
-                    'changePercent': ticker.get('changePercent') or ticker.get('percentage', 0),
-                    'high': ticker.get('high', 0), 'low': ticker.get('low', 0),
-                    'open': ticker.get('open', 0), 'previousClose': ticker.get('previousClose', 0),
-                    'source': 'ticker'
+                    'changePercent': (
+                        ticker.get('changePercent')
+                        or ticker.get('percentage', 0)
+                    ),
+                    'high': ticker.get('high', 0),
+                    'low': ticker.get('low', 0),
+                    'open': ticker.get('open', 0),
+                    'previousClose': ticker.get('previousClose', 0),
+                    'source': 'ticker',
                 }
         except Exception:
             pass
@@ -457,15 +329,21 @@ class KlineService:
             klines = self.get_kline(market, symbol, '1D', 2)
             if klines and len(klines) > 0:
                 latest = klines[-1]
-                prev = klines[-2]['close'] if len(klines) > 1 else latest.get('open', 0)
+                prev = (
+                    klines[-2]['close']
+                    if len(klines) > 1
+                    else latest.get('open', 0)
+                )
                 price = latest.get('close', 0)
                 chg = round(price - prev, 4) if prev else 0
                 pct = round(chg / prev * 100, 2) if prev and prev > 0 else 0
                 return {
                     'price': price, 'change': chg, 'changePercent': pct,
-                    'high': latest.get('high', 0), 'low': latest.get('low', 0),
-                    'open': latest.get('open', 0), 'previousClose': prev,
-                    'source': 'kline_1d'
+                    'high': latest.get('high', 0),
+                    'low': latest.get('low', 0),
+                    'open': latest.get('open', 0),
+                    'previousClose': prev,
+                    'source': 'kline_1d',
                 }
         except Exception:
             pass
@@ -490,6 +368,7 @@ class KlineService:
             invalidate(symbol="SH600519")   # 清某只股票的所有缓存
         """
         if symbol:
+            from app.data_sources.normalizer import detect_market
             market, digits = detect_market(symbol)
             count = 0
 
@@ -519,25 +398,16 @@ class KlineService:
         return self._cache.stats()
 
     def source_stats(self) -> Dict[str, Any]:
-        """各数据源吞吐统计（由协助层跟踪）"""
-        from app.data_sources.source_config import get_all_enabled_sources
-        return {
-            cfg.name: {
-                "qps": round(cfg.throughput, 2),
-                "success_rate": round(cfg.success_rate, 3),
-                "avg_latency": round(cfg.avg_latency, 3),
-                "effective_weight": round(cfg.effective_weight(), 2),
-                "max_workers": cfg.max_workers,
-                "markets": list(cfg.markets),
-            }
-            for cfg in get_all_enabled_sources()
-        }
+        """各数据源吞吐统计（委托给 DataSourceFactory）"""
+        return self._factory.source_stats()
 
     # ═══════════════════════════════════════════════════════════════════
     #  预热
     # ═══════════════════════════════════════════════════════════════════
 
-    def prewarm_all(self, symbols: List[str], market: str = "CNStock") -> Dict[str, bool]:
+    def prewarm_all(
+        self, symbols: List[str], market: str = "CNStock",
+    ) -> Dict[str, bool]:
         """
         统一预热入口 — 批量拉取K线写入缓存。
 
@@ -549,40 +419,10 @@ class KlineService:
         try:
             fetched = self.get_kline_batch(market, symbols, "1D", 300)
             results["1D"] = len(fetched) > 0
-            logger.info(f"[预热] {market} 1D: {len(fetched)}/{len(symbols)} 成功")
+            logger.info(
+                f"[预热] {market} 1D: {len(fetched)}/{len(symbols)} 成功"
+            )
         except Exception as e:
             logger.warning(f"[预热] {market} 1D 失败: {e}")
             results["1D"] = False
         return results
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  内部方法
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _fetch_ticker(self, symbol: str, market: str = "") -> Optional[Dict[str, Any]]:
-        """内部: 顺序fallback取行情"""
-        providers = [
-            (p.name, lambda p=p: p.fetch_quote(symbol))
-            for p in get_providers("quote", market=market or None)
-        ]
-        result, src = sequential_fallback(symbol, providers, self._cb)
-        if result:
-            logger.info(f"[行情] {symbol} 来源={src}")
-        else:
-            names = [p.name for p in get_providers("quote", market=market or None)]
-            logger.warning(f"[行情] {symbol} 全部源失败: {names}")
-        return result
-
-    def _fetch_kline(self, symbol: str, timeframe: str, limit: int, market: str = "") -> Optional[List]:
-        """内部: 顺序fallback取K线"""
-        providers = [
-            (p.name, lambda p=p: p.fetch_kline(symbol, timeframe, limit))
-            for p in get_providers("kline", timeframe=timeframe, market=market or None)
-        ]
-        result, src = sequential_fallback(symbol, providers, self._cb)
-        if result:
-            logger.info(f"[K线] {symbol} tf={timeframe} 来源={src} bars={len(result)}")
-        else:
-            names = [p.name for p in get_providers("kline", timeframe=timeframe, market=market or None)]
-            logger.warning(f"[K线] {symbol} tf={timeframe} 全部源失败: {names}")
-        return result
